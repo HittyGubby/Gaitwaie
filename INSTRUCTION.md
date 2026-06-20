@@ -158,6 +158,11 @@ user2:
   prompt: 1000 (1k)
   completion: 10000 (10k)
   total: 11000 (11k)
+--- total ---
+  requests: 168
+  prompt: 11000 (11k)
+  completion: 1010000 (1.01M)
+  total: 1021000 (1.02M)
 
 ```
 
@@ -175,6 +180,11 @@ user2:
   prompt: 200 (200)
   completion: 3000 (3k)
   total: 3200 (3.2k)
+--- total ---
+  requests: 15
+  prompt: 1200 (1.2k)
+  completion: 13000 (13k)
+  total: 14200 (14.2k)
 
 ```
 

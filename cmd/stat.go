@@ -61,13 +61,24 @@ Examples:
 			return nil
 		}
 
+		var totalReqs, totalPrompt, totalCompletion, totalTokens int
 		for name, stat := range stats {
 			fmt.Printf("%s:\n", name)
 			fmt.Printf("  requests: %d\n", stat.RequestCount)
 			fmt.Printf("  prompt: %d (%s)\n", stat.PromptTokens, formatTokens(stat.PromptTokens))
 			fmt.Printf("  completion: %d (%s)\n", stat.CompletionTokens, formatTokens(stat.CompletionTokens))
 			fmt.Printf("  total: %d (%s)\n", stat.TotalTokens, formatTokens(stat.TotalTokens))
+			totalReqs += stat.RequestCount
+			totalPrompt += stat.PromptTokens
+			totalCompletion += stat.CompletionTokens
+			totalTokens += stat.TotalTokens
 		}
+
+		fmt.Println("--- total ---")
+		fmt.Printf("  requests: %d\n", totalReqs)
+		fmt.Printf("  prompt: %d (%s)\n", totalPrompt, formatTokens(totalPrompt))
+		fmt.Printf("  completion: %d (%s)\n", totalCompletion, formatTokens(totalCompletion))
+		fmt.Printf("  total: %d (%s)\n", totalTokens, formatTokens(totalTokens))
 
 		return nil
 	},

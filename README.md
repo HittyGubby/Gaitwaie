@@ -119,6 +119,11 @@ bob:
   prompt: 1000 (1k)
   completion: 10000 (10k)
   total: 11000 (11k)
+--- total ---
+  requests: 168
+  prompt: 11000 (11k)
+  completion: 1010000 (1.01M)
+  total: 1021000 (1.02M)
 ```
 
 ### `purge` — 检测并移除失效 Key
