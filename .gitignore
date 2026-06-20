@@ -1,0 +1,25 @@
+# Binaries
+/gateway
+gateway.exe
+
+# Database files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local config
+config.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build output
+/tmp/
