@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/HittyGubby/gaitwaie/internal/models"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // DB wraps the SQLite connection and provides typed access methods.
@@ -16,7 +16,7 @@ type DB struct {
 
 // Open opens (or creates) the SQLite database and ensures tables exist.
 func Open(path string) (*DB, error) {
-	conn, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	conn, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}

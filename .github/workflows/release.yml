@@ -31,7 +31,7 @@ jobs:
 
       - name: Build
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=1 \
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
             go build -o "gateway_${{ matrix.goos }}_${{ matrix.goarch }}" -ldflags="-s -w" .
 
       - name: Upload Artifact
