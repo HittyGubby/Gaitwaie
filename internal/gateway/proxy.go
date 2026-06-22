@@ -130,21 +130,20 @@ func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Reque
 func (s *Server) handleUpstreamError(w http.ResponseWriter, keyValue string, err error, model, alias string, receiver *receiverInfo) {
 	// Record the failed request
 	reqLog := &models.RequestLog{
-		Timestamp:      time.Now(),
-		StatusCode:     0, // no HTTP response
-		PromptTokens:   0,
-		CompletionTokens: 0,
-		TotalTokens:    0,
-		ProviderAlias:  alias,
-		RequestedModel: model,
-		AssignedKey:    keyValue,
-		ReceiverName:   "",
-		ReceiverKey:    "",
-		IsTestRequest:  false,
+		Timestamp:          time.Now(),
+		StatusCode:         0, // no HTTP response
+		PromptTokens:       0,
+		CompletionTokens:   0,
+		TotalTokens:        0,
+		CachedPromptTokens: 0,
+		ProviderAlias:      alias,
+		RequestedModel:     model,
+		AssignedKey:        keyValue,
+		ReceiverName:       "",
+		IsTestRequest:      false,
 	}
 	if receiver != nil {
 		reqLog.ReceiverName = receiver.Name
-		reqLog.ReceiverKey = receiver.Key
 	}
 	if err := s.db.InsertRequestLog(reqLog); err != nil {
 		log.Printf("[proxy] failed to log request: %v", err)
@@ -179,24 +178,23 @@ func (s *Server) handleNonStreaming(w http.ResponseWriter, upstreamResp *http.Re
 	s.updateKeyState(keyValue, upstreamResp.StatusCode)
 
 	// Try to extract token usage from response
-	promptTokens, completionTokens := extractUsageFromBody(bodyBytes)
+	promptTokens, cachedTokens, completionTokens := extractUsageFromBody(bodyBytes)
 
 	reqLog := &models.RequestLog{
-		Timestamp:        time.Now(),
-		StatusCode:       upstreamResp.StatusCode,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		TotalTokens:      promptTokens + completionTokens,
-		ProviderAlias:    alias,
-		RequestedModel:   model,
-		AssignedKey:      keyValue,
-		ReceiverName:     "",
-		ReceiverKey:      "",
-		IsTestRequest:    false,
+		Timestamp:           time.Now(),
+		StatusCode:          upstreamResp.StatusCode,
+		PromptTokens:        promptTokens,
+		CompletionTokens:    completionTokens,
+		TotalTokens:         promptTokens + completionTokens,
+		CachedPromptTokens:  cachedTokens,
+		ProviderAlias:       alias,
+		RequestedModel:      model,
+		AssignedKey:         keyValue,
+		ReceiverName:        "",
+		IsTestRequest:       false,
 	}
 	if receiver != nil {
 		reqLog.ReceiverName = receiver.Name
-		reqLog.ReceiverKey = receiver.Key
 	}
 	if err := s.db.InsertRequestLog(reqLog); err != nil {
 		log.Printf("[proxy] failed to log request: %v", err)
@@ -240,24 +238,23 @@ func (s *Server) handleStreaming(w http.ResponseWriter, upstreamResp *http.Respo
 	s.updateKeyState(keyValue, upstreamResp.StatusCode)
 
 	// Extract token usage from last usage line
-	promptTokens, completionTokens := extractUsageFromSSELine(lastUsageLine)
+	promptTokens, cachedTokens, completionTokens := extractUsageFromSSELine(lastUsageLine)
 
 	reqLog := &models.RequestLog{
-		Timestamp:        time.Now(),
-		StatusCode:       upstreamResp.StatusCode,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		TotalTokens:      promptTokens + completionTokens,
-		ProviderAlias:    alias,
-		RequestedModel:   model,
-		AssignedKey:      keyValue,
-		ReceiverName:     "",
-		ReceiverKey:      "",
-		IsTestRequest:    false,
+		Timestamp:           time.Now(),
+		StatusCode:          upstreamResp.StatusCode,
+		PromptTokens:        promptTokens,
+		CompletionTokens:    completionTokens,
+		TotalTokens:         promptTokens + completionTokens,
+		CachedPromptTokens:  cachedTokens,
+		ProviderAlias:       alias,
+		RequestedModel:      model,
+		AssignedKey:         keyValue,
+		ReceiverName:        "",
+		IsTestRequest:       false,
 	}
 	if receiver != nil {
 		reqLog.ReceiverName = receiver.Name
-		reqLog.ReceiverKey = receiver.Key
 	}
 	if err := s.db.InsertRequestLog(reqLog); err != nil {
 		log.Printf("[proxy] failed to log request: %v", err)
@@ -336,10 +333,12 @@ func replaceModelField(body []byte, newModel string) []byte {
 }
 
 // extractUsageFromSSELine parses token usage from a single SSE data line.
-// Example input: `data: {"usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}}`
-func extractUsageFromSSELine(line string) (int, int) {
+// Returns (billablePromptTokens, cachedPromptTokens, completionTokens).
+// For providers with prompt caching (like DeepSeek), billablePromptTokens is
+// prompt_cache_miss_tokens; for others it falls back to prompt_tokens.
+func extractUsageFromSSELine(line string) (int, int, int) {
 	if line == "" {
-		return 0, 0
+		return 0, 0, 0
 	}
 
 	// Strip "data: " prefix if present
@@ -350,23 +349,45 @@ func extractUsageFromSSELine(line string) (int, int) {
 
 	var data struct {
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens          int `json:"prompt_tokens"`
+			CompletionTokens      int `json:"completion_tokens"`
+			PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+			PromptTokensDetails   *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	if data.Usage != nil {
-		return data.Usage.PromptTokens, data.Usage.CompletionTokens
+	if data.Usage == nil {
+		return 0, 0, 0
 	}
-	return 0, 0
+
+	u := data.Usage
+	cached := u.PromptCacheHitTokens
+	if cached == 0 && u.PromptTokensDetails != nil {
+		cached = u.PromptTokensDetails.CachedTokens
+	}
+
+	billable := u.PromptCacheMissTokens
+	if billable == 0 {
+		// No cache miss field: use prompt_tokens minus cached, or full prompt_tokens
+		if cached > 0 && u.PromptTokens > cached {
+			billable = u.PromptTokens - cached
+		} else {
+			billable = u.PromptTokens
+		}
+	}
+
+	return billable, cached, u.CompletionTokens
 }
 
 // extractUsageFromBody parses token usage from a non-streaming JSON response body.
-func extractUsageFromBody(body []byte) (int, int) {
+func extractUsageFromBody(body []byte) (int, int, int) {
 	if len(body) == 0 {
-		return 0, 0
+		return 0, 0, 0
 	}
 	return extractUsageFromSSELine(string(body))
 }

@@ -55,11 +55,11 @@ func (db *DB) migrate() error {
 			prompt_tokens INTEGER,
 			completion_tokens INTEGER,
 			total_tokens INTEGER,
+			cached_prompt_tokens INTEGER DEFAULT 0,
 			provider_alias TEXT,
 			requested_model TEXT,
 			assigned_key TEXT,
 			receiver_name TEXT,
-			receiver_key TEXT,
 			is_test_request INTEGER DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS key_states (
@@ -81,6 +81,17 @@ func (db *DB) migrate() error {
 			return fmt.Errorf("exec migration: %w", err)
 		}
 	}
+
+	// Migrations for existing databases:
+	// 1. Add cached_prompt_tokens column if missing
+	if _, err := db.conn.Exec("ALTER TABLE request_logs ADD COLUMN cached_prompt_tokens INTEGER DEFAULT 0"); err != nil {
+		// Ignore - column already exists
+	}
+	// 2. Remove receiver_key column if it exists (SQLite 3.35.0+)
+	db.conn.Exec("ALTER TABLE request_logs DROP COLUMN receiver_key")
+	// 3. Remove request_content column if it exists (SQLite 3.35.0+)
+	db.conn.Exec("ALTER TABLE request_logs DROP COLUMN request_content")
+
 	return nil
 }
 
@@ -166,6 +177,65 @@ func (db *DB) GetProviderKeys(alias string) ([]models.KeyState, error) {
 	return keys, rows.Err()
 }
 
+// GetAllDisabledKeys returns all disabled keys (is_active = 0) grouped by provider.
+func (db *DB) GetAllDisabledKeys() ([]models.KeyState, error) {
+	rows, err := db.conn.Query(
+		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
+		 FROM key_states WHERE is_active = 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []models.KeyState
+	for rows.Next() {
+		var ks models.KeyState
+		var coolDown sql.NullString
+		var updatedAt string
+		if err := rows.Scan(&ks.KeyValue, &ks.ProviderAlias, &ks.FailCount, &ks.IsActive, &coolDown, &updatedAt); err != nil {
+			return nil, err
+		}
+		if coolDown.Valid {
+			t, err := time.Parse("2006-01-02 15:04:05", coolDown.String)
+			if err == nil {
+				ks.CoolDownUntil = &t
+			}
+		}
+		ks.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+		keys = append(keys, ks)
+	}
+	return keys, rows.Err()
+}
+
+// GetKey returns a specific key state by key value.
+func (db *DB) GetKey(keyValue string) (*models.KeyState, error) {
+	var ks models.KeyState
+	var coolDown sql.NullString
+	var updatedAt string
+	err := db.conn.QueryRow(
+		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
+		 FROM key_states WHERE key_value = ?`, keyValue).Scan(
+		&ks.KeyValue, &ks.ProviderAlias, &ks.FailCount, &ks.IsActive, &coolDown, &updatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if coolDown.Valid {
+		t, err := time.Parse("2006-01-02 15:04:05", coolDown.String)
+		if err == nil {
+			ks.CoolDownUntil = &t
+		}
+	}
+	ks.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+	return &ks, nil
+}
+
+// ReenableKey activates a previously disabled key and resets its fail count.
+func (db *DB) ReenableKey(keyValue string) error {
+	_, err := db.conn.Exec(
+		`UPDATE key_states SET is_active = 1, fail_count = 0, cool_down_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE key_value = ?`, keyValue)
+	return err
+}
+
 // ResetFailCount sets fail_count to 0 for a key.
 func (db *DB) ResetFailCount(keyValue string) error {
 	_, err := db.conn.Exec(
@@ -234,12 +304,13 @@ func (db *DB) InsertRequestLog(log *models.RequestLog) error {
 	_, err := db.conn.Exec(
 		`INSERT INTO request_logs
 		 (status_code, prompt_tokens, completion_tokens, total_tokens,
-		  provider_alias, requested_model, assigned_key,
-		  receiver_name, receiver_key, is_test_request)
+		  cached_prompt_tokens, provider_alias, requested_model, assigned_key,
+		  receiver_name, is_test_request)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		log.StatusCode, log.PromptTokens, log.CompletionTokens, log.TotalTokens,
+		log.CachedPromptTokens,
 		log.ProviderAlias, log.RequestedModel, log.AssignedKey,
-		log.ReceiverName, log.ReceiverKey, boolToInt(log.IsTestRequest))
+		log.ReceiverName, boolToInt(log.IsTestRequest))
 	return err
 }
 

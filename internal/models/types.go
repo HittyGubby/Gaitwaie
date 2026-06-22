@@ -31,19 +31,19 @@ type KeyState struct {
 // RequestLog represents a single proxied request log entry.
 // When used for aggregated stats (from QueryStats), RequestCount carries the row count.
 type RequestLog struct {
-	ID               int
-	Timestamp        time.Time
-	StatusCode       int
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	RequestCount     int          // populated only in aggregated queries
-	ProviderAlias    string
-	RequestedModel   string
-	AssignedKey      string
-	ReceiverName     string
-	ReceiverKey      string
-	IsTestRequest    bool
+	ID                 int
+	Timestamp          time.Time
+	StatusCode         int
+	PromptTokens       int  // billable prompt tokens (cache miss, falls back to total)
+	CompletionTokens   int
+	TotalTokens        int
+	CachedPromptTokens int  // prompt tokens served from cache (0 if not reported)
+	RequestCount       int  // populated only in aggregated queries
+	ProviderAlias      string
+	RequestedModel     string
+	AssignedKey        string
+	ReceiverName       string
+	IsTestRequest      bool
 }
 
 // OpenAIModel represents a model returned by the OpenAI-compatible /v1/models endpoint.

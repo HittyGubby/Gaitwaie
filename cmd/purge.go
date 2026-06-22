@@ -252,17 +252,17 @@ func testKeys(client *http.Client, cfg *models.Config, db *database.DB, choice p
 
 			// Record the test request in the database
 			reqLog := &models.RequestLog{
-				Timestamp:        time.Now(),
-				StatusCode:       200,
-				PromptTokens:     0,
-				CompletionTokens: tokens,
-				TotalTokens:      tokens,
-				ProviderAlias:    choice.alias,
-				RequestedModel:   choice.model,
-				AssignedKey:      kv,
-				ReceiverName:     "purge",
-				ReceiverKey:      "purge",
-				IsTestRequest:    true,
+				Timestamp:           time.Now(),
+				StatusCode:          200,
+				PromptTokens:        tokens,
+				CompletionTokens:    tokens,
+				TotalTokens:         tokens,
+				CachedPromptTokens:  0,
+				ProviderAlias:       choice.alias,
+				RequestedModel:      choice.model,
+				AssignedKey:         kv,
+				ReceiverName:        "purge",
+				IsTestRequest:       true,
 			}
 			if errStr != "" {
 				reqLog.StatusCode = 0
@@ -326,7 +326,7 @@ func sendTestRequest(client *http.Client, url, key string, body []byte) (bool, i
 	}
 
 	// Parse token usage
-	promptTokens, completionTokens := extractUsageForPurge(lastUsageLine)
+	promptTokens, _, completionTokens := extractUsageForPurge(lastUsageLine)
 	totalTokens := promptTokens + completionTokens
 
 	// If scanner error, it might still be partial success
@@ -338,9 +338,9 @@ func sendTestRequest(client *http.Client, url, key string, body []byte) (bool, i
 }
 
 // extractUsageForPurge parses token usage from an SSE line (same logic as in proxy).
-func extractUsageForPurge(line string) (int, int) {
+func extractUsageForPurge(line string) (int, int, int) {
 	if line == "" {
-		return 0, 0
+		return 0, 0, 0
 	}
 
 	jsonStr := line
@@ -350,17 +350,38 @@ func extractUsageForPurge(line string) (int, int) {
 
 	var data struct {
 		Usage *struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
+			PromptTokens          int `json:"prompt_tokens"`
+			CompletionTokens      int `json:"completion_tokens"`
+			PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens"`
+			PromptCacheMissTokens int `json:"prompt_cache_miss_tokens"`
+			PromptTokensDetails   *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	if data.Usage != nil {
-		return data.Usage.PromptTokens, data.Usage.CompletionTokens
+	if data.Usage == nil {
+		return 0, 0, 0
 	}
-	return 0, 0
+
+	u := data.Usage
+	cached := u.PromptCacheHitTokens
+	if cached == 0 && u.PromptTokensDetails != nil {
+		cached = u.PromptTokensDetails.CachedTokens
+	}
+
+	billable := u.PromptCacheMissTokens
+	if billable == 0 {
+		if cached > 0 && u.PromptTokens > cached {
+			billable = u.PromptTokens - cached
+		} else {
+			billable = u.PromptTokens
+		}
+	}
+
+	return billable, cached, u.CompletionTokens
 }
 
 // maskPurgeKey masks a key for display (shows first 8 chars + last 4 chars).
