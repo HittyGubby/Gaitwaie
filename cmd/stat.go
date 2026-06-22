@@ -119,6 +119,10 @@ func parseDuration(input string) (time.Duration, error) {
 // formatTokens formats a token count into a human-readable short form.
 func formatTokens(n int) string {
 	switch {
+	case n >= 1_000_000_000_000:
+		return fmt.Sprintf("%.3fT", float64(n)/1_000_000_000_000)
+	case n >= 1_000_000_000:
+		return fmt.Sprintf("%.3fB", float64(n)/1_000_000_000)
 	case n >= 1_000_000:
 		return fmt.Sprintf("%.2fM", float64(n)/1_000_000)
 	case n >= 1_000:
