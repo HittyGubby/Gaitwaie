@@ -42,6 +42,12 @@ func Load(path string) (*models.Config, error) {
 		cfg.StripParams = &defaults
 	}
 
+	// Default: auto-disable keys when fail count reaches tolerance
+	if cfg.DisableOnTolerance == nil {
+		t := true
+		cfg.DisableOnTolerance = &t
+	}
+
 	// Validate required fields
 	if len(cfg.Providers) == 0 {
 		return nil, fmt.Errorf("config must have at least one provider")

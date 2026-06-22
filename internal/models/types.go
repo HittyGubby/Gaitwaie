@@ -8,6 +8,7 @@ type Config struct {
 	ListenAddr         string              `yaml:"listen_addr"`
 	Tolerance          int                 `yaml:"tolerance"`
 	MaxConcurrentTasks int                 `yaml:"max_concurrent_tasks"`
+	DisableOnTolerance *bool               `yaml:"disable_on_tolerance,omitempty"`
 	StripParams        *[]string           `yaml:"strip_params,omitempty"`
 	Providers          map[string]Provider `yaml:"providers"`
 	Receivers          map[string]string   `yaml:"receivers"`
@@ -40,6 +41,7 @@ type RequestLog struct {
 	TotalTokens        int
 	CachedPromptTokens int  // prompt tokens served from cache (0 if not reported)
 	RequestCount       int  // populated only in aggregated queries
+	KeyCount           int  // distinct keys used, populated only in aggregated queries
 	ProviderAlias      string
 	RequestedModel     string
 	AssignedKey        string

@@ -37,10 +37,10 @@ and routes them to upstream providers.`,
 		}
 		defer db.Close()
 
-		// Ensure all provider keys exist in the database
+		// Sync keys with YAML config (inserts new keys, deactivates removed keys)
 		for alias, provider := range cfg.Providers {
-			if err := db.EnsureKeys(alias, provider.Keys); err != nil {
-				return fmt.Errorf("ensure keys for %q: %w", alias, err)
+			if err := db.SyncKeysExclusive(alias, provider.Keys); err != nil {
+				return fmt.Errorf("sync keys for %q: %w", alias, err)
 			}
 		}
 

@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"time"
 
@@ -61,10 +62,19 @@ Examples:
 			return nil
 		}
 
-		var totalReqs, totalPrompt, totalCompletion, totalTokens int
-		for name, stat := range stats {
+		// Sort receiver names for deterministic output, total last
+		var names []string
+		for name := range stats {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		var totalReqs, totalPrompt, totalCompletion, totalTokens, totalKeys int
+		for _, name := range names {
+			stat := stats[name]
 			fmt.Printf("%s:\n", name)
 			fmt.Printf("  requests: %d\n", stat.RequestCount)
+			fmt.Printf("  used keys: %d\n", stat.KeyCount)
 			fmt.Printf("  prompt: %d (%s)\n", stat.PromptTokens, formatTokens(stat.PromptTokens))
 			fmt.Printf("  completion: %d (%s)\n", stat.CompletionTokens, formatTokens(stat.CompletionTokens))
 			fmt.Printf("  total: %d (%s)\n", stat.TotalTokens, formatTokens(stat.TotalTokens))
@@ -72,10 +82,12 @@ Examples:
 			totalPrompt += stat.PromptTokens
 			totalCompletion += stat.CompletionTokens
 			totalTokens += stat.TotalTokens
+			totalKeys += stat.KeyCount
 		}
 
 		fmt.Println("--- total ---")
 		fmt.Printf("  requests: %d\n", totalReqs)
+		fmt.Printf("  used keys: %d\n", totalKeys)
 		fmt.Printf("  prompt: %d (%s)\n", totalPrompt, formatTokens(totalPrompt))
 		fmt.Printf("  completion: %d (%s)\n", totalCompletion, formatTokens(totalCompletion))
 		fmt.Printf("  total: %d (%s)\n", totalTokens, formatTokens(totalTokens))

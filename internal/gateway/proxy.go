@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +15,7 @@ import (
 	"github.com/HittyGubby/gaitwaie/internal/models"
 )
 
-// postChatCompletionsHandler handles POST /v1/chat/completions.
+// postChatCompletionsHandler handles POST /v1/chat/completions with transparent retry.
 func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	// Read the original body
 	bodyBytes, err := io.ReadAll(r.Body)
@@ -53,28 +54,6 @@ func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Get an active key via round-robin
-	activeKeys, err := s.db.GetActiveKeys(alias)
-	if err != nil {
-		log.Printf("[proxy] db error for provider %q: %v", alias, err)
-		writeOpenAIError(w, http.StatusInternalServerError, "Internal server error", "server_error", "500")
-		return
-	}
-	if len(activeKeys) == 0 {
-		writeOpenAIError(w, http.StatusBadGateway,
-			fmt.Sprintf("No active keys for provider %q", alias),
-			"no_active_keys", "502")
-		return
-	}
-
-	selected := s.pickKey(alias, activeKeys)
-	if selected == nil {
-		writeOpenAIError(w, http.StatusBadGateway,
-			fmt.Sprintf("No active keys for provider %q", alias),
-			"no_active_keys", "502")
-		return
-	}
-
 	receiver := getReceiverFromContext(r)
 
 	// Inject stream_options into the request body
@@ -94,7 +73,6 @@ func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Reque
 	if len(parts) > 1 {
 		upstreamModel = parts[1]
 	} else {
-		// Fallback: use the original model name
 		upstreamModel = chatReq.Model
 	}
 
@@ -103,40 +81,122 @@ func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Reque
 
 	upstreamURL := strings.TrimRight(provider.BaseURL, "/") + "/chat/completions"
 
-	// Create upstream request
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), "POST", upstreamURL, bytes.NewReader(modifiedBody))
+	// Phase 1 & 2 transparent retry
+	upstreamResp, usedKey, err := s.sendWithRetry(r.Context(), upstreamURL, modifiedBody, alias, chatReq.Model, receiver)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error", "500")
-		return
-	}
-	upstreamReq.Header.Set("Content-Type", "application/json")
-	upstreamReq.Header.Set("Authorization", "Bearer "+selected.KeyValue)
-
-	// Forward the request
-	upstreamResp, err := s.httpClient.Do(upstreamReq)
-	if err != nil {
-		log.Printf("[proxy] upstream request failed for key %q: %v", maskKey(selected.KeyValue), err)
-		s.handleUpstreamError(w, selected.KeyValue, err, chatReq.Model, alias, receiver)
+		log.Printf("[proxy] all retry attempts exhausted for %q: %v", alias, err)
+		writeOpenAIError(w, http.StatusBadGateway,
+			fmt.Sprintf("All upstream keys failed for provider %q", alias),
+			"upstream_error", "502")
 		return
 	}
 	defer upstreamResp.Body.Close()
 
 	// Handle non-streaming response
 	if !chatReq.Stream {
-		s.handleNonStreaming(w, upstreamResp, selected.KeyValue, chatReq.Model, alias, receiver)
+		s.handleNonStreaming(w, upstreamResp, usedKey, chatReq.Model, alias, receiver)
 		return
 	}
 
 	// Handle streaming response
-	s.handleStreaming(w, upstreamResp, selected.KeyValue, chatReq.Model, alias, receiver)
+	s.handleStreaming(w, upstreamResp, usedKey, chatReq.Model, alias, receiver)
 }
 
-// handleUpstreamError processes upstream request failures (network errors, timeouts, etc.).
-func (s *Server) handleUpstreamError(w http.ResponseWriter, keyValue string, err error, model, alias string, receiver *receiverInfo) {
-	// Record the failed request
+// sendWithRetry implements two-phase transparent retry.
+// Phase 1: try active keys (YAML keys with is_active=1).
+// Phase 2 (dead-key resurrection): if all active keys fail, try ALL YAML keys.
+// If a Phase 2 key succeeds, it is automatically re-enabled in the database.
+func (s *Server) sendWithRetry(ctx context.Context, upstreamURL string, body []byte, alias, model string, receiver *receiverInfo) (*http.Response, string, error) {
+	providerCfg := s.cfg.Providers[alias]
+	yamlKeys := providerCfg.Keys
+
+	// Phase 1 — active keys only
+	activeKeys, err := s.db.GetActiveKeysInList(alias, yamlKeys)
+	if err != nil {
+		return nil, "", fmt.Errorf("db error: %w", err)
+	}
+	for _, key := range activeKeys {
+		resp, tryErr := s.tryKey(ctx, key.KeyValue, upstreamURL, body, alias, model, receiver)
+		if tryErr == nil {
+			// Success — reset fail count
+			if err := s.db.ResetFailCount(key.KeyValue); err != nil {
+				log.Printf("[proxy] failed to reset fail count for %q: %v", maskKey(key.KeyValue), err)
+			}
+			return resp, key.KeyValue, nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+
+	// Phase 2 — dead-key resurrection: try ALL YAML keys (regardless of is_active)
+	log.Printf("[proxy] Phase 1 exhausted for %q, entering Phase 2 dead-key fallback...", alias)
+	allKeys, err := s.db.GetAllKeysInList(alias, yamlKeys)
+	if err != nil {
+		return nil, "", fmt.Errorf("db error: %w", err)
+	}
+	for _, key := range allKeys {
+		resp, tryErr := s.tryKey(ctx, key.KeyValue, upstreamURL, body, alias, model, receiver)
+		if tryErr == nil {
+			// Resurrect: re-enable and reset fail count
+			log.Printf("[proxy] dead key %q resurrected!", maskKey(key.KeyValue))
+			if err := s.db.ReenableKey(key.KeyValue); err != nil {
+				log.Printf("[proxy] failed to re-enable key %q: %v", maskKey(key.KeyValue), err)
+			}
+			if err := s.db.ResetFailCount(key.KeyValue); err != nil {
+				log.Printf("[proxy] failed to reset fail count for %q: %v", maskKey(key.KeyValue), err)
+			}
+			return resp, key.KeyValue, nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+
+	return nil, "", fmt.Errorf("all keys failed for provider %q", alias)
+}
+
+// tryKey sends a single request to upstream with the given key.
+// Returns the response on success (HTTP 200). On failure, records the failure
+// in the database and returns an error (without writing to the client).
+func (s *Server) tryKey(ctx context.Context, keyValue, upstreamURL string, body []byte, alias, model string, receiver *receiverInfo) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+keyValue)
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		// Network error — record failure and return
+		s.recordKeyFailure(keyValue, 0, err, alias, model, receiver)
+		return resp, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		// Non-200 — record failure and return
+		// Read body for logging but discard it (retry will create a new request)
+		errMsg := fmt.Sprintf("HTTP %d", resp.StatusCode)
+		log.Printf("[proxy] key %q returned %s", maskKey(keyValue), errMsg)
+		s.recordKeyFailure(keyValue, resp.StatusCode, nil, alias, model, receiver)
+		return resp, fmt.Errorf("%s", errMsg)
+	}
+
+	return resp, nil
+}
+
+// recordKeyFailure logs the failed request and updates the circuit breaker state.
+// It does NOT write any response to the client — that's the caller's responsibility.
+func (s *Server) recordKeyFailure(keyValue string, statusCode int, netErr error, alias, model string, receiver *receiverInfo) {
+	code := statusCode
+	if netErr != nil {
+		code = 0
+	}
+
 	reqLog := &models.RequestLog{
 		Timestamp:          time.Now(),
-		StatusCode:         0, // no HTTP response
+		StatusCode:         code,
 		PromptTokens:       0,
 		CompletionTokens:   0,
 		TotalTokens:        0,
@@ -154,16 +214,19 @@ func (s *Server) handleUpstreamError(w http.ResponseWriter, keyValue string, err
 		log.Printf("[proxy] failed to log request: %v", err)
 	}
 
-	// Increment fail count (network error = circuit breaker trigger)
-	broken, err := s.db.IncrementFailCount(keyValue, s.cfg.Tolerance)
-	if err != nil {
-		log.Printf("[proxy] failed to increment fail count: %v", err)
+	if netErr != nil {
+		// Network error: increment fail count (circuit breaker)
+		broken, incErr := s.db.IncrementFailCount(keyValue, s.cfg.Tolerance, *s.cfg.DisableOnTolerance)
+		if incErr != nil {
+			log.Printf("[proxy] failed to increment fail count: %v", incErr)
+		}
+		if broken {
+			log.Printf("[proxy] key %q auto-deactivated (network error)", maskKey(keyValue))
+		}
+	} else {
+		// HTTP error: use state machine
+		s.updateKeyState(keyValue, statusCode)
 	}
-	if broken {
-		log.Printf("[proxy] key %q auto-deactivated due to network error", maskKey(keyValue))
-	}
-
-	writeOpenAIError(w, http.StatusBadGateway, "Upstream request failed: "+err.Error(), "upstream_error", "502")
 }
 
 // handleNonStreaming processes a non-streaming upstream response.
@@ -288,7 +351,7 @@ func (s *Server) updateKeyState(keyValue string, statusCode int) {
 
 	case statusCode >= 500:
 		// 5xx: increment fail count
-		broken, err := s.db.IncrementFailCount(keyValue, s.cfg.Tolerance)
+		broken, err := s.db.IncrementFailCount(keyValue, s.cfg.Tolerance, *s.cfg.DisableOnTolerance)
 		if err != nil {
 			log.Printf("[proxy] failed to increment fail count: %v", err)
 		}
@@ -298,7 +361,7 @@ func (s *Server) updateKeyState(keyValue string, statusCode int) {
 
 	default:
 		// Other 4xx: increment fail count
-		broken, err := s.db.IncrementFailCount(keyValue, s.cfg.Tolerance)
+		broken, err := s.db.IncrementFailCount(keyValue, s.cfg.Tolerance, *s.cfg.DisableOnTolerance)
 		if err != nil {
 			log.Printf("[proxy] failed to increment fail count: %v", err)
 		}

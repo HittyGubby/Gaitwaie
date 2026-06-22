@@ -44,6 +44,9 @@ listen_addr: ":8080"
 tolerance: 3
 max_concurrent_tasks: 5
 
+# Auto-disable keys when fail count reaches tolerance (default: true)
+disable_on_tolerance: true
+
 # Request parameters to strip before forwarding upstream.
 # Defaults to max_tokens-family fields if omitted. Set to [] to disable.
 strip_params:

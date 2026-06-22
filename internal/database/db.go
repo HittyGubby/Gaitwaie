@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/HittyGubby/gaitwaie/internal/models"
@@ -117,11 +118,156 @@ func (db *DB) EnsureKeys(alias string, keys []string) error {
 	return tx.Commit()
 }
 
+// SyncKeysExclusive aligns the key_states table with the YAML config for one provider.
+// It inserts new keys, and deactivates keys that exist in the DB but no longer in YAML.
+// This ensures only YAML-declared keys participate in retry/fallback.
+func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. Insert any new keys from YAML
+	insertStmt, err := tx.Prepare(`INSERT OR IGNORE INTO key_states (key_value, provider_alias, is_active) VALUES (?, ?, 1)`)
+	if err != nil {
+		return err
+	}
+	defer insertStmt.Close()
+
+	for _, key := range yamlKeys {
+		if _, err := insertStmt.Exec(key, alias); err != nil {
+			return err
+		}
+	}
+
+	// 2. Deactivate keys in DB that are no longer in YAML
+	// Build placeholders for the IN clause
+	if len(yamlKeys) > 0 {
+		placeholders := make([]string, len(yamlKeys))
+		args := make([]any, len(yamlKeys)+1)
+		args[0] = alias
+		for i, k := range yamlKeys {
+			placeholders[i] = "?"
+			args[i+1] = k
+		}
+
+		query := fmt.Sprintf(
+			`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND key_value NOT IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		if _, err := tx.Exec(query, args...); err != nil {
+			return err
+		}
+	} else {
+		// No YAML keys for this provider — deactivate all
+		if _, err := tx.Exec(`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ?`, alias); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 // GetActiveKeys returns all active keys for a given provider.
 func (db *DB) GetActiveKeys(alias string) ([]models.KeyState, error) {
 	rows, err := db.conn.Query(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
 		 FROM key_states WHERE provider_alias = ? AND is_active = 1`, alias)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []models.KeyState
+	for rows.Next() {
+		var ks models.KeyState
+		var coolDown sql.NullString
+		var updatedAt string
+		if err := rows.Scan(&ks.KeyValue, &ks.ProviderAlias, &ks.FailCount, &ks.IsActive, &coolDown, &updatedAt); err != nil {
+			return nil, err
+		}
+		if coolDown.Valid {
+			t, err := time.Parse("2006-01-02 15:04:05", coolDown.String)
+			if err == nil {
+				ks.CoolDownUntil = &t
+			}
+		}
+		ks.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+		keys = append(keys, ks)
+	}
+	return keys, rows.Err()
+}
+
+// GetActiveKeysInList returns active keys for a provider, filtered to only the given YAML keys.
+// This ensures only keys declared in the YAML config participate in routing.
+func (db *DB) GetActiveKeysInList(alias string, validKeys []string) ([]models.KeyState, error) {
+	if len(validKeys) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(validKeys))
+	args := make([]any, len(validKeys)+1)
+	args[0] = alias
+	for i, k := range validKeys {
+		placeholders[i] = "?"
+		args[i+1] = k
+	}
+
+	query := fmt.Sprintf(
+		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
+		 FROM key_states WHERE provider_alias = ? AND is_active = 1 AND key_value IN (%s)`,
+		strings.Join(placeholders, ","),
+	)
+
+	rows, err := db.conn.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []models.KeyState
+	for rows.Next() {
+		var ks models.KeyState
+		var coolDown sql.NullString
+		var updatedAt string
+		if err := rows.Scan(&ks.KeyValue, &ks.ProviderAlias, &ks.FailCount, &ks.IsActive, &coolDown, &updatedAt); err != nil {
+			return nil, err
+		}
+		if coolDown.Valid {
+			t, err := time.Parse("2006-01-02 15:04:05", coolDown.String)
+			if err == nil {
+				ks.CoolDownUntil = &t
+			}
+		}
+		ks.UpdatedAt, _ = time.Parse("2006-01-02 15:04:05", updatedAt)
+		keys = append(keys, ks)
+	}
+	return keys, rows.Err()
+}
+
+// GetAllKeysInList returns ALL keys (active and inactive) for a provider, filtered to only the given YAML keys.
+// Used in Phase 2 (dead-key fallback) when no active keys are available.
+func (db *DB) GetAllKeysInList(alias string, validKeys []string) ([]models.KeyState, error) {
+	if len(validKeys) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, len(validKeys))
+	args := make([]any, len(validKeys)+1)
+	args[0] = alias
+	for i, k := range validKeys {
+		placeholders[i] = "?"
+		args[i+1] = k
+	}
+
+	query := fmt.Sprintf(
+		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
+		 FROM key_states WHERE provider_alias = ? AND key_value IN (%s)`,
+		strings.Join(placeholders, ","),
+	)
+
+	rows, err := db.conn.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -243,9 +389,9 @@ func (db *DB) ResetFailCount(keyValue string) error {
 	return err
 }
 
-// IncrementFailCount increments fail_count. If it reaches tolerance, auto-deactivates.
-// Returns true if the key was deactivated (circuit broken).
-func (db *DB) IncrementFailCount(keyValue string, tolerance int) (bool, error) {
+// IncrementFailCount increments fail_count. If it reaches tolerance and disableOnTolerance
+// is true, auto-deactivates the key. Returns true if the key was deactivated (circuit broken).
+func (db *DB) IncrementFailCount(keyValue string, tolerance int, disableOnTolerance bool) (bool, error) {
 	res, err := db.conn.Exec(
 		`UPDATE key_states SET fail_count = fail_count + 1, updated_at = CURRENT_TIMESTAMP WHERE key_value = ?`, keyValue)
 	if err != nil {
@@ -262,7 +408,7 @@ func (db *DB) IncrementFailCount(keyValue string, tolerance int) (bool, error) {
 		return false, err
 	}
 
-	if failCount >= tolerance {
+	if failCount >= tolerance && disableOnTolerance {
 		_, err = db.conn.Exec(
 			`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE key_value = ?`, keyValue)
 		return true, err
@@ -326,7 +472,8 @@ func (db *DB) QueryStats(since *time.Time) (map[string]*models.RequestLog, error
 			        COUNT(*),
 			        COALESCE(SUM(prompt_tokens), 0),
 			        COALESCE(SUM(completion_tokens), 0),
-			        COALESCE(SUM(total_tokens), 0)
+			        COALESCE(SUM(total_tokens), 0),
+			        COUNT(DISTINCT assigned_key)
 			 FROM request_logs
 			 WHERE status_code = 200 AND is_test_request = 0 AND timestamp >= ?
 			 GROUP BY receiver_name`, since.Format("2006-01-02 15:04:05"))
@@ -336,7 +483,8 @@ func (db *DB) QueryStats(since *time.Time) (map[string]*models.RequestLog, error
 			        COUNT(*),
 			        COALESCE(SUM(prompt_tokens), 0),
 			        COALESCE(SUM(completion_tokens), 0),
-			        COALESCE(SUM(total_tokens), 0)
+			        COALESCE(SUM(total_tokens), 0),
+			        COUNT(DISTINCT assigned_key)
 			 FROM request_logs
 			 WHERE status_code = 200 AND is_test_request = 0
 			 GROUP BY receiver_name`)
@@ -349,7 +497,7 @@ func (db *DB) QueryStats(since *time.Time) (map[string]*models.RequestLog, error
 	stats := make(map[string]*models.RequestLog)
 	for rows.Next() {
 		var rl models.RequestLog
-		if err := rows.Scan(&rl.ReceiverName, &rl.RequestCount, &rl.PromptTokens, &rl.CompletionTokens, &rl.TotalTokens); err != nil {
+		if err := rows.Scan(&rl.ReceiverName, &rl.RequestCount, &rl.PromptTokens, &rl.CompletionTokens, &rl.TotalTokens, &rl.KeyCount); err != nil {
 			return nil, err
 		}
 		stats[rl.ReceiverName] = &rl
