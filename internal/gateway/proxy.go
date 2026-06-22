@@ -84,6 +84,11 @@ func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Strip configured parameters if enabled (prevents upstream 400 errors from oversized/zero limits)
+	if s.cfg.StripParams != nil && len(*s.cfg.StripParams) > 0 {
+		modifiedBody = stripParams(modifiedBody, *s.cfg.StripParams)
+	}
+
 	// Build upstream URL
 	upstreamModel := chatReq.Model
 	if len(parts) > 1 {
@@ -319,6 +324,25 @@ func injectStreamOptions(body []byte, stream bool) ([]byte, error) {
 	}
 
 	return json.Marshal(data)
+}
+
+// stripParams removes the given parameter names from the request body JSON.
+// This prevents upstream 400 errors when clients send oversized or zero max token limits.
+func stripParams(body []byte, params []string) []byte {
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return body
+	}
+
+	for _, key := range params {
+		delete(data, key)
+	}
+
+	result, err := json.Marshal(data)
+	if err != nil {
+		return body
+	}
+	return result
 }
 
 // replaceModelField replaces the "model" field in the JSON body.

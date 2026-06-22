@@ -30,6 +30,18 @@ func Load(path string) (*models.Config, error) {
 		cfg.ListenAddr = ":8080"
 	}
 
+	// Default: strip max-token parameters that cause upstream 400s
+	if cfg.StripParams == nil {
+		defaults := []string{
+			"max_tokens",
+			"max_completion_tokens",
+			"max_output_tokens",
+			"max_gen_tokens",
+			"max_new_tokens",
+		}
+		cfg.StripParams = &defaults
+	}
+
 	// Validate required fields
 	if len(cfg.Providers) == 0 {
 		return nil, fmt.Errorf("config must have at least one provider")

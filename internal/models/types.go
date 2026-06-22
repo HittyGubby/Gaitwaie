@@ -8,6 +8,7 @@ type Config struct {
 	ListenAddr         string              `yaml:"listen_addr"`
 	Tolerance          int                 `yaml:"tolerance"`
 	MaxConcurrentTasks int                 `yaml:"max_concurrent_tasks"`
+	StripParams        *[]string           `yaml:"strip_params,omitempty"`
 	Providers          map[string]Provider `yaml:"providers"`
 	Receivers          map[string]string   `yaml:"receivers"`
 }
