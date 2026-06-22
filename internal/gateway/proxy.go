@@ -120,7 +120,7 @@ func (s *Server) sendWithRetry(ctx context.Context, upstreamURL string, body []b
 		if tryErr == nil {
 			// Success — reset fail count
 			if err := s.db.ResetFailCount(key.KeyValue); err != nil {
-				log.Printf("[proxy] failed to reset fail count for %q: %v", maskKey(key.KeyValue), err)
+				log.Printf("[proxy] failed to reset fail count for %q: %v", key.KeyValue, err)
 			}
 			return resp, key.KeyValue, nil
 		}
@@ -139,12 +139,12 @@ func (s *Server) sendWithRetry(ctx context.Context, upstreamURL string, body []b
 		resp, tryErr := s.tryKey(ctx, key.KeyValue, upstreamURL, body, alias, model, receiver)
 		if tryErr == nil {
 			// Resurrect: re-enable and reset fail count
-			log.Printf("[proxy] dead key %q resurrected!", maskKey(key.KeyValue))
+			log.Printf("[proxy] dead key %q resurrected!", key.KeyValue)
 			if err := s.db.ReenableKey(key.KeyValue); err != nil {
-				log.Printf("[proxy] failed to re-enable key %q: %v", maskKey(key.KeyValue), err)
+				log.Printf("[proxy] failed to re-enable key %q: %v", key.KeyValue, err)
 			}
 			if err := s.db.ResetFailCount(key.KeyValue); err != nil {
-				log.Printf("[proxy] failed to reset fail count for %q: %v", maskKey(key.KeyValue), err)
+				log.Printf("[proxy] failed to reset fail count for %q: %v", key.KeyValue, err)
 			}
 			return resp, key.KeyValue, nil
 		}
@@ -178,7 +178,7 @@ func (s *Server) tryKey(ctx context.Context, keyValue, upstreamURL string, body 
 		// Non-200 — record failure and return
 		// Read body for logging but discard it (retry will create a new request)
 		errMsg := fmt.Sprintf("HTTP %d", resp.StatusCode)
-		log.Printf("[proxy] key %q returned %s", maskKey(keyValue), errMsg)
+		log.Printf("[proxy] key %q returned %s", keyValue, errMsg)
 		s.recordKeyFailure(keyValue, resp.StatusCode, nil, alias, model, receiver)
 		return resp, fmt.Errorf("%s", errMsg)
 	}
@@ -221,7 +221,7 @@ func (s *Server) recordKeyFailure(keyValue string, statusCode int, netErr error,
 			log.Printf("[proxy] failed to increment fail count: %v", incErr)
 		}
 		if broken {
-			log.Printf("[proxy] key %q auto-deactivated (network error)", maskKey(keyValue))
+			log.Printf("[proxy] key %q auto-deactivated (network error)", keyValue)
 		}
 	} else {
 		// HTTP error: use state machine
@@ -335,7 +335,7 @@ func (s *Server) updateKeyState(keyValue string, statusCode int) {
 	case statusCode == http.StatusOK:
 		// 200: reset fail count
 		if err := s.db.ResetFailCount(keyValue); err != nil {
-			log.Printf("[proxy] failed to reset fail count for key %q: %v", maskKey(keyValue), err)
+			log.Printf("[proxy] failed to reset fail count for key %q: %v", keyValue, err)
 		}
 
 	case statusCode == http.StatusTooManyRequests:
@@ -345,9 +345,9 @@ func (s *Server) updateKeyState(keyValue string, statusCode int) {
 	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
 		// 401/403: direct deactivation
 		if err := s.db.DirectDeactivate(keyValue); err != nil {
-			log.Printf("[proxy] failed to deactivate key %q: %v", maskKey(keyValue), err)
+			log.Printf("[proxy] failed to deactivate key %q: %v", keyValue, err)
 		}
-		log.Printf("[proxy] key %q deactivated due to status %d", maskKey(keyValue), statusCode)
+		log.Printf("[proxy] key %q deactivated due to status %d", keyValue, statusCode)
 
 	case statusCode >= 500:
 		// 5xx: increment fail count
@@ -356,7 +356,7 @@ func (s *Server) updateKeyState(keyValue string, statusCode int) {
 			log.Printf("[proxy] failed to increment fail count: %v", err)
 		}
 		if broken {
-			log.Printf("[proxy] key %q auto-deactivated (fail count >= %d)", maskKey(keyValue), s.cfg.Tolerance)
+			log.Printf("[proxy] key %q auto-deactivated (fail count >= %d)", keyValue, s.cfg.Tolerance)
 		}
 
 	default:
@@ -366,7 +366,7 @@ func (s *Server) updateKeyState(keyValue string, statusCode int) {
 			log.Printf("[proxy] failed to increment fail count: %v", err)
 		}
 		if broken {
-			log.Printf("[proxy] key %q auto-deactivated (fail count >= %d)", maskKey(keyValue), s.cfg.Tolerance)
+			log.Printf("[proxy] key %q auto-deactivated (fail count >= %d)", keyValue, s.cfg.Tolerance)
 		}
 	}
 }
@@ -477,12 +477,4 @@ func extractUsageFromBody(body []byte) (int, int, int) {
 		return 0, 0, 0
 	}
 	return extractUsageFromSSELine(string(body))
-}
-
-// maskKey returns a masked version of an API key for logging (shows first 8 chars).
-func maskKey(key string) string {
-	if len(key) <= 8 {
-		return key[:min(len(key), 4)] + "****"
-	}
-	return key[:8] + "****"
 }
