@@ -79,6 +79,15 @@ listen_addr: ":8080"
 tolerance: 3
 max_concurrent_tasks: 5
 
+# Request parameters to strip before forwarding upstream.
+# Defaults to max_tokens-family fields if omitted. Set to [] to disable.
+strip_params:
+  - max_tokens
+  - max_completion_tokens
+  - max_output_tokens
+  - max_gen_tokens
+  - max_new_tokens
+
 providers:
   # ds:
   #   base_url: "https://api.deepseek.com/v1"

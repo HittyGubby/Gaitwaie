@@ -1,6 +1,6 @@
 # Gaitwaie
 
-Gaitwaie 是一个极简、高性能的多租户（Receiver）隔离 OpenAI 兼容格式路由网关，专为需要与朋友们共享 AI API Key 的场景设计。
+Gaitwaie 是一个极简、高性能的多租户（Receiver）隔离 OpenAI 兼容格式路由网关
 
 ## 特性
 
@@ -43,6 +43,15 @@ database_path: "/var/lib/gaitwaie/gateway.db"
 listen_addr: ":8080"
 tolerance: 3
 max_concurrent_tasks: 5
+
+# Request parameters to strip before forwarding upstream.
+# Defaults to max_tokens-family fields if omitted. Set to [] to disable.
+strip_params:
+  - max_tokens
+  - max_completion_tokens
+  - max_output_tokens
+  - max_gen_tokens
+  - max_new_tokens
 
 providers:
   ds:
@@ -125,6 +134,15 @@ bob:
   completion: 1010000 (1.01M)
   total: 1021000 (1.02M)
 ```
+
+### `enable` — 重新启用失效 Key
+
+```bash
+gateway enable                 # 交互式列出所有失效 Key 并选择重新启用
+gateway enable sk-xxxx-key    # 直接重新启用指定 Key
+```
+
+当 Key 因熔断被自动禁用后，可使用此命令手动恢复。
 
 ### `purge` — 检测并移除失效 Key
 
