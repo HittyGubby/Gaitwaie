@@ -93,6 +93,21 @@ func (db *DB) migrate() error {
 	// 3. Remove request_content column if it exists (SQLite 3.35.0+)
 	db.conn.Exec("ALTER TABLE request_logs DROP COLUMN request_content")
 
+	// 4. Add is_deleted column to key_states
+	if _, err := db.conn.Exec("ALTER TABLE key_states ADD COLUMN is_deleted INTEGER DEFAULT 0"); err != nil {
+		// Ignore - column already exists
+	}
+
+	// 5. Create model_cache table
+	if _, err := db.conn.Exec(`CREATE TABLE IF NOT EXISTS model_cache (
+		provider_alias TEXT,
+		model_id TEXT,
+		fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (provider_alias, model_id)
+	)`); err != nil {
+		return fmt.Errorf("create model_cache: %w", err)
+	}
+
 	return nil
 }
 
@@ -153,7 +168,7 @@ func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 		}
 
 		query := fmt.Sprintf(
-			`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND key_value NOT IN (%s)`,
+			`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND key_value NOT IN (%s) AND COALESCE(is_deleted, 0) = 0`,
 			strings.Join(placeholders, ","),
 		)
 		if _, err := tx.Exec(query, args...); err != nil {
@@ -161,7 +176,7 @@ func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 		}
 	} else {
 		// No YAML keys for this provider — deactivate all
-		if _, err := tx.Exec(`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ?`, alias); err != nil {
+		if _, err := tx.Exec(`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND COALESCE(is_deleted, 0) = 0`, alias); err != nil {
 			return err
 		}
 	}
@@ -173,7 +188,7 @@ func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 func (db *DB) GetActiveKeys(alias string) ([]models.KeyState, error) {
 	rows, err := db.conn.Query(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE provider_alias = ? AND is_active = 1`, alias)
+			 FROM key_states WHERE provider_alias = ? AND is_active = 1 AND COALESCE(is_deleted, 0) = 0`, alias)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +231,7 @@ func (db *DB) GetActiveKeysInList(alias string, validKeys []string) ([]models.Ke
 
 	query := fmt.Sprintf(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE provider_alias = ? AND is_active = 1 AND key_value IN (%s)`,
+		 FROM key_states WHERE provider_alias = ? AND is_active = 1 AND COALESCE(is_deleted, 0) = 0 AND key_value IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 
@@ -263,7 +278,7 @@ func (db *DB) GetAllKeysInList(alias string, validKeys []string) ([]models.KeySt
 
 	query := fmt.Sprintf(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE provider_alias = ? AND key_value IN (%s)`,
+		 FROM key_states WHERE provider_alias = ? AND COALESCE(is_deleted, 0) = 0 AND key_value IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 
@@ -297,7 +312,7 @@ func (db *DB) GetAllKeysInList(alias string, validKeys []string) ([]models.KeySt
 func (db *DB) GetProviderKeys(alias string) ([]models.KeyState, error) {
 	rows, err := db.conn.Query(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE provider_alias = ?`, alias)
+		 FROM key_states WHERE provider_alias = ? AND COALESCE(is_deleted, 0) = 0`, alias)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +342,7 @@ func (db *DB) GetProviderKeys(alias string) ([]models.KeyState, error) {
 func (db *DB) GetAllDisabledKeys() ([]models.KeyState, error) {
 	rows, err := db.conn.Query(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE is_active = 0`)
+		 FROM key_states WHERE is_active = 0 AND COALESCE(is_deleted, 0) = 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -510,4 +525,104 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// SoftDeleteKey marks a key as deleted (soft delete) and deactivates it.
+func (db *DB) SoftDeleteKey(keyValue string) error {
+	_, err := db.conn.Exec(
+		`UPDATE key_states SET is_deleted = 1, is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE key_value = ?`, keyValue)
+	return err
+}
+
+// DisableKey deactivates a key without changing its fail count.
+func (db *DB) DisableKey(keyValue string) error {
+	_, err := db.conn.Exec(
+		`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE key_value = ?`, keyValue)
+	return err
+}
+
+// GetAllKeyStats returns all non-deleted key states with aggregated request stats.
+// Used by the manage TUI to display per-key usage.
+func (db *DB) GetAllKeyStats() ([]models.KeyStats, error) {
+	rows, err := db.conn.Query(`
+		SELECT
+			ks.key_value, ks.provider_alias, ks.fail_count, ks.is_active,
+			COALESCE(rl.req_count, 0),
+			COALESCE(rl.prompt_tok, 0),
+			COALESCE(rl.compl_tok, 0),
+			COALESCE(rl.total_tok, 0)
+		FROM key_states ks
+		LEFT JOIN (
+			SELECT assigned_key,
+			       COUNT(*) as req_count,
+			       SUM(prompt_tokens) as prompt_tok,
+			       SUM(completion_tokens) as compl_tok,
+			       SUM(total_tokens) as total_tok
+			FROM request_logs
+			WHERE is_test_request = 0
+			GROUP BY assigned_key
+		) rl ON ks.key_value = rl.assigned_key
+		WHERE COALESCE(ks.is_deleted, 0) = 0
+		ORDER BY ks.provider_alias, ks.key_value
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var stats []models.KeyStats
+	for rows.Next() {
+		var s models.KeyStats
+		if err := rows.Scan(&s.KeyValue, &s.ProviderAlias, &s.FailCount, &s.IsActive,
+			&s.RequestCount, &s.PromptTokens, &s.CompletionTokens, &s.TotalTokens); err != nil {
+			return nil, err
+		}
+		stats = append(stats, s)
+	}
+	return stats, rows.Err()
+}
+
+// SaveModelCache persists fetched model IDs for a provider to SQLite.
+func (db *DB) SaveModelCache(alias string, modelIDs []string) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM model_cache WHERE provider_alias = ?", alias); err != nil {
+		return err
+	}
+
+	stmt, err := tx.Prepare("INSERT INTO model_cache (provider_alias, model_id) VALUES (?, ?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, m := range modelIDs {
+		if _, err := stmt.Exec(alias, m); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// GetModelCache reads all cached model IDs from SQLite.
+func (db *DB) GetModelCache() (map[string][]string, error) {
+	rows, err := db.conn.Query("SELECT provider_alias, model_id FROM model_cache ORDER BY provider_alias, model_id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string][]string)
+	for rows.Next() {
+		var alias, modelID string
+		if err := rows.Scan(&alias, &modelID); err != nil {
+			return nil, err
+		}
+		result[alias] = append(result[alias], modelID)
+	}
+	return result, rows.Err()
 }

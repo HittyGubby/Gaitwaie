@@ -26,6 +26,7 @@ type KeyState struct {
 	ProviderAlias string
 	FailCount     int
 	IsActive      bool
+	IsDeleted     bool
 	CoolDownUntil *time.Time
 	UpdatedAt     time.Time
 }
@@ -47,6 +48,19 @@ type RequestLog struct {
 	AssignedKey        string
 	ReceiverName       string
 	IsTestRequest      bool
+}
+
+// KeyStats combines key state with aggregated request statistics.
+// Used by the manage TUI to display per-key usage.
+type KeyStats struct {
+	KeyValue         string
+	ProviderAlias    string
+	FailCount        int
+	IsActive         bool
+	RequestCount     int
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
 }
 
 // OpenAIModel represents a model returned by the OpenAI-compatible /v1/models endpoint.

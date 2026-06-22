@@ -50,7 +50,7 @@ func (s *Server) RefreshModels() error {
 		go func(alias string, provider providerConfig) {
 			defer wg.Done()
 
-			models, err := fetchProviderModels(s.httpClient, provider.BaseURL, provider.Keys, alias)
+			models, err := FetchProviderModels(s.httpClient, provider.BaseURL, provider.Keys, alias)
 			if err != nil {
 				log.Printf("[models] failed to fetch models for provider %q: %v", alias, err)
 				return
@@ -59,6 +59,11 @@ func (s *Server) RefreshModels() error {
 			mu.Lock()
 			cache.models[alias] = models
 			mu.Unlock()
+
+			// Persist to SQLite for CLI access (manage command)
+			if err := s.db.SaveModelCache(alias, models); err != nil {
+				log.Printf("[models] failed to persist models for %q: %v", alias, err)
+			}
 		}(alias, provider)
 	}
 
@@ -73,7 +78,7 @@ func (s *Server) RefreshModels() error {
 	return nil
 }
 
-func fetchProviderModels(client *http.Client, baseURL string, keys []string, alias string) ([]string, error) {
+func FetchProviderModels(client *http.Client, baseURL string, keys []string, alias string) ([]string, error) {
 	url := strings.TrimRight(baseURL, "/") + "/models"
 	var lastErr error
 
