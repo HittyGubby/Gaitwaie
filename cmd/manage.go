@@ -97,10 +97,10 @@ type manageModel struct {
 	state tuiState
 
 	// Model selection modal
-	modalAlias   string
-	modalModels  []string
-	modalCursor  int
-	modalOffset  int
+	modalAlias  string
+	modalModels []string
+	modalCursor int
+	modalOffset int
 
 	// Delete confirmation
 	deleteKey string
@@ -185,6 +185,7 @@ func (m manageModel) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			row := m.rows[m.selectableIdxs[m.cursorIdx]]
 			if row.stats != nil {
 				m.deleteKey = row.stats.KeyValue
+				m.modalAlias = row.stats.ProviderAlias
 				m.state = stateDeleteConfirm
 			}
 		}
@@ -311,6 +312,12 @@ func (m manageModel) updateDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y":
 		m.db.SoftDeleteKey(m.deleteKey)
+		if err := config.RemoveProviderKey(configPath, m.modalAlias, m.deleteKey); err != nil {
+			m.err = fmt.Errorf("update config: %w", err)
+		}
+		if cfg, err := config.Load(configPath); err == nil {
+			m.cfg = cfg
+		}
 		m.state = stateNormal
 		m.refreshData()
 		m.deleteKey = ""
@@ -410,13 +417,13 @@ func (m manageModel) computeColWidths() (keyW, statusW, failW, reqW, promptW, co
 	spacing := 9 // 7 single-space separators + 1 double-space before TEST
 
 	// Natural widths: start with header label widths
-	keyW = 2 + len("KEY")            // "  KEY"
+	keyW = 2 + len("KEY") // "  KEY"
 	statusW = len("STATUS")
 	failW = len("FAILURES")
 	reqW = len("REQUESTS")
-	promptW = len("PROMPT TOKEN")
-	complW = len("COMPLETION TOKEN")
-	totalW = len("TOTAL TOKEN")
+	promptW = len("PROMPT-TOKEN")
+	complW = len("COMPLETION-TOKEN")
+	totalW = len("TOTAL-TOKEN")
 
 	// Expand to fit data
 	for _, row := range m.rows {
@@ -466,9 +473,9 @@ func (m manageModel) renderColumnHeaders() string {
 	statusCol := lipgloss.NewStyle().Width(statusW).MaxWidth(statusW).Bold(true).Render("STATUS")
 	failCol := lipgloss.NewStyle().Width(failW).MaxWidth(failW).Bold(true).Align(lipgloss.Right).Render("FAILURES")
 	reqCol := lipgloss.NewStyle().Width(reqW).MaxWidth(reqW).Bold(true).Align(lipgloss.Right).Render("REQUESTS")
-	promptCol := lipgloss.NewStyle().Width(promptW).MaxWidth(promptW).Bold(true).Align(lipgloss.Right).Render("PROMPT TOKEN")
-	complCol := lipgloss.NewStyle().Width(complW).MaxWidth(complW).Bold(true).Align(lipgloss.Right).Render("COMPLETION TOKEN")
-	totalCol := lipgloss.NewStyle().Width(totalW).MaxWidth(totalW).Bold(true).Align(lipgloss.Right).Render("TOTAL TOKEN")
+	promptCol := lipgloss.NewStyle().Width(promptW).MaxWidth(promptW).Bold(true).Align(lipgloss.Right).Render("PROMPT-TOKEN")
+	complCol := lipgloss.NewStyle().Width(complW).MaxWidth(complW).Bold(true).Align(lipgloss.Right).Render("COMPLETION-TOKEN")
+	totalCol := lipgloss.NewStyle().Width(totalW).MaxWidth(totalW).Bold(true).Align(lipgloss.Right).Render("TOTAL-TOKEN")
 	testCol := lipgloss.NewStyle().Width(testW).MaxWidth(testW).Bold(true).Render("TEST")
 
 	return lipgloss.JoinHorizontal(lipgloss.Top,

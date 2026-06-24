@@ -64,3 +64,41 @@ func Load(path string) (*models.Config, error) {
 
 	return &cfg, nil
 }
+
+// RemoveProviderKey removes a key from a provider in the YAML config file.
+func RemoveProviderKey(path, alias, keyValue string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+
+	var cfg models.Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+
+	provider, ok := cfg.Providers[alias]
+	if !ok {
+		return nil
+	}
+
+	var newKeys []string
+	for _, k := range provider.Keys {
+		if k != keyValue {
+			newKeys = append(newKeys, k)
+		}
+	}
+	provider.Keys = newKeys
+	cfg.Providers[alias] = provider
+
+	out, err := yaml.Marshal(&cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+
+	if err := os.WriteFile(path, out, 0644); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	return nil
+}

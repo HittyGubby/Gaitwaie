@@ -37,7 +37,7 @@ and routes them to upstream providers.`,
 		}
 		defer db.Close()
 
-		// Sync keys with YAML config (inserts new keys, deactivates removed keys)
+		// Sync keys with YAML config (inserts new keys, soft-deletes removed keys)
 		for alias, provider := range cfg.Providers {
 			if err := db.SyncKeysExclusive(alias, provider.Keys); err != nil {
 				return fmt.Errorf("sync keys for %q: %w", alias, err)

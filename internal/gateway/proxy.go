@@ -216,7 +216,11 @@ func (s *Server) recordKeyFailure(keyValue string, statusCode int, netErr error,
 
 	if netErr != nil {
 		// Network error: increment fail count (circuit breaker)
-		broken, incErr := s.db.IncrementFailCount(keyValue, s.cfg.Tolerance, *s.cfg.DisableOnTolerance)
+		disableOnTolerance := false
+		if s.cfg.DisableOnTolerance != nil {
+			disableOnTolerance = *s.cfg.DisableOnTolerance
+		}
+		broken, incErr := s.db.IncrementFailCount(keyValue, s.cfg.Tolerance, disableOnTolerance)
 		if incErr != nil {
 			log.Printf("[proxy] failed to increment fail count: %v", incErr)
 		}
@@ -249,17 +253,17 @@ func (s *Server) handleNonStreaming(w http.ResponseWriter, upstreamResp *http.Re
 	promptTokens, cachedTokens, completionTokens := extractUsageFromBody(bodyBytes)
 
 	reqLog := &models.RequestLog{
-		Timestamp:           time.Now(),
-		StatusCode:          upstreamResp.StatusCode,
-		PromptTokens:        promptTokens,
-		CompletionTokens:    completionTokens,
-		TotalTokens:         promptTokens + completionTokens,
-		CachedPromptTokens:  cachedTokens,
-		ProviderAlias:       alias,
-		RequestedModel:      model,
-		AssignedKey:         keyValue,
-		ReceiverName:        "",
-		IsTestRequest:       false,
+		Timestamp:          time.Now(),
+		StatusCode:         upstreamResp.StatusCode,
+		PromptTokens:       promptTokens,
+		CompletionTokens:   completionTokens,
+		TotalTokens:        promptTokens + completionTokens,
+		CachedPromptTokens: cachedTokens,
+		ProviderAlias:      alias,
+		RequestedModel:     model,
+		AssignedKey:        keyValue,
+		ReceiverName:       "",
+		IsTestRequest:      false,
 	}
 	if receiver != nil {
 		reqLog.ReceiverName = receiver.Name
@@ -309,17 +313,17 @@ func (s *Server) handleStreaming(w http.ResponseWriter, upstreamResp *http.Respo
 	promptTokens, cachedTokens, completionTokens := extractUsageFromSSELine(lastUsageLine)
 
 	reqLog := &models.RequestLog{
-		Timestamp:           time.Now(),
-		StatusCode:          upstreamResp.StatusCode,
-		PromptTokens:        promptTokens,
-		CompletionTokens:    completionTokens,
-		TotalTokens:         promptTokens + completionTokens,
-		CachedPromptTokens:  cachedTokens,
-		ProviderAlias:       alias,
-		RequestedModel:      model,
-		AssignedKey:         keyValue,
-		ReceiverName:        "",
-		IsTestRequest:       false,
+		Timestamp:          time.Now(),
+		StatusCode:         upstreamResp.StatusCode,
+		PromptTokens:       promptTokens,
+		CompletionTokens:   completionTokens,
+		TotalTokens:        promptTokens + completionTokens,
+		CachedPromptTokens: cachedTokens,
+		ProviderAlias:      alias,
+		RequestedModel:     model,
+		AssignedKey:        keyValue,
+		ReceiverName:       "",
+		IsTestRequest:      false,
 	}
 	if receiver != nil {
 		reqLog.ReceiverName = receiver.Name

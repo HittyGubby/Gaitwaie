@@ -134,8 +134,8 @@ func (db *DB) EnsureKeys(alias string, keys []string) error {
 }
 
 // SyncKeysExclusive aligns the key_states table with the YAML config for one provider.
-// It inserts new keys, and deactivates keys that exist in the DB but no longer in YAML.
-// This ensures only YAML-declared keys participate in retry/fallback.
+// It inserts new keys, and marks keys that exist in the DB but no longer in YAML as deleted.
+// This ensures only YAML-declared keys appear in manage and participate in retry/fallback.
 func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 	tx, err := db.conn.Begin()
 	if err != nil {
@@ -156,7 +156,7 @@ func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 		}
 	}
 
-	// 2. Deactivate keys in DB that are no longer in YAML
+	// 2. Mark keys in DB that are no longer in YAML as deleted
 	// Build placeholders for the IN clause
 	if len(yamlKeys) > 0 {
 		placeholders := make([]string, len(yamlKeys))
@@ -168,19 +168,18 @@ func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 		}
 
 		query := fmt.Sprintf(
-			`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND key_value NOT IN (%s) AND COALESCE(is_deleted, 0) = 0`,
+			`UPDATE key_states SET is_deleted = 1, is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND key_value NOT IN (%s) AND COALESCE(is_deleted, 0) = 0`,
 			strings.Join(placeholders, ","),
 		)
 		if _, err := tx.Exec(query, args...); err != nil {
 			return err
 		}
 	} else {
-		// No YAML keys for this provider — deactivate all
-		if _, err := tx.Exec(`UPDATE key_states SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND COALESCE(is_deleted, 0) = 0`, alias); err != nil {
+		// No YAML keys for this provider — mark all as deleted
+		if _, err := tx.Exec(`UPDATE key_states SET is_deleted = 1, is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND COALESCE(is_deleted, 0) = 0`, alias); err != nil {
 			return err
 		}
 	}
-
 	return tx.Commit()
 }
 
