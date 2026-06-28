@@ -44,7 +44,7 @@ and routes them to upstream providers.`,
 			}
 		}
 
-		srv := gateway.NewServer(cfg, db)
+		srv := gateway.NewServer(cfg, configPath, db)
 
 		// Start async model refresh
 		srv.RefreshModelsAsync()

@@ -93,12 +93,7 @@ func (db *DB) migrate() error {
 	// 3. Remove request_content column if it exists (SQLite 3.35.0+)
 	db.conn.Exec("ALTER TABLE request_logs DROP COLUMN request_content")
 
-	// 4. Add is_deleted column to key_states
-	if _, err := db.conn.Exec("ALTER TABLE key_states ADD COLUMN is_deleted INTEGER DEFAULT 0"); err != nil {
-		// Ignore - column already exists
-	}
-
-	// 5. Create model_cache table
+	// 4. Create model_cache table
 	if _, err := db.conn.Exec(`CREATE TABLE IF NOT EXISTS model_cache (
 		provider_alias TEXT,
 		model_id TEXT,
@@ -133,9 +128,9 @@ func (db *DB) EnsureKeys(alias string, keys []string) error {
 	return tx.Commit()
 }
 
-// SyncKeysExclusive aligns the key_states table with the YAML config for one provider.
-// It inserts new keys, and marks keys that exist in the DB but no longer in YAML as deleted.
-// This ensures only YAML-declared keys appear in manage and participate in retry/fallback.
+// SyncKeysExclusive ensures all YAML-declared keys exist in the database.
+// It inserts new keys but does NOT delete keys that are no longer in YAML.
+// Key deletion is managed solely by editing the YAML file.
 func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 	tx, err := db.conn.Begin()
 	if err != nil {
@@ -143,40 +138,14 @@ func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 	}
 	defer tx.Rollback()
 
-	// 1. Insert any new keys from YAML
-	insertStmt, err := tx.Prepare(`INSERT OR IGNORE INTO key_states (key_value, provider_alias, is_active) VALUES (?, ?, 1)`)
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO key_states (key_value, provider_alias, is_active) VALUES (?, ?, 1)`)
 	if err != nil {
 		return err
 	}
-	defer insertStmt.Close()
+	defer stmt.Close()
 
 	for _, key := range yamlKeys {
-		if _, err := insertStmt.Exec(key, alias); err != nil {
-			return err
-		}
-	}
-
-	// 2. Mark keys in DB that are no longer in YAML as deleted
-	// Build placeholders for the IN clause
-	if len(yamlKeys) > 0 {
-		placeholders := make([]string, len(yamlKeys))
-		args := make([]any, len(yamlKeys)+1)
-		args[0] = alias
-		for i, k := range yamlKeys {
-			placeholders[i] = "?"
-			args[i+1] = k
-		}
-
-		query := fmt.Sprintf(
-			`UPDATE key_states SET is_deleted = 1, is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND key_value NOT IN (%s) AND COALESCE(is_deleted, 0) = 0`,
-			strings.Join(placeholders, ","),
-		)
-		if _, err := tx.Exec(query, args...); err != nil {
-			return err
-		}
-	} else {
-		// No YAML keys for this provider — mark all as deleted
-		if _, err := tx.Exec(`UPDATE key_states SET is_deleted = 1, is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE provider_alias = ? AND COALESCE(is_deleted, 0) = 0`, alias); err != nil {
+		if _, err := stmt.Exec(key, alias); err != nil {
 			return err
 		}
 	}
@@ -187,7 +156,7 @@ func (db *DB) SyncKeysExclusive(alias string, yamlKeys []string) error {
 func (db *DB) GetActiveKeys(alias string) ([]models.KeyState, error) {
 	rows, err := db.conn.Query(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-			 FROM key_states WHERE provider_alias = ? AND is_active = 1 AND COALESCE(is_deleted, 0) = 0`, alias)
+			 FROM key_states WHERE provider_alias = ? AND is_active = 1`, alias)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +199,7 @@ func (db *DB) GetActiveKeysInList(alias string, validKeys []string) ([]models.Ke
 
 	query := fmt.Sprintf(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE provider_alias = ? AND is_active = 1 AND COALESCE(is_deleted, 0) = 0 AND key_value IN (%s)`,
+		 FROM key_states WHERE provider_alias = ? AND is_active = 1 AND key_value IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 
@@ -277,7 +246,7 @@ func (db *DB) GetAllKeysInList(alias string, validKeys []string) ([]models.KeySt
 
 	query := fmt.Sprintf(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE provider_alias = ? AND COALESCE(is_deleted, 0) = 0 AND key_value IN (%s)`,
+		 FROM key_states WHERE provider_alias = ? AND key_value IN (%s)`,
 		strings.Join(placeholders, ","),
 	)
 
@@ -311,7 +280,7 @@ func (db *DB) GetAllKeysInList(alias string, validKeys []string) ([]models.KeySt
 func (db *DB) GetProviderKeys(alias string) ([]models.KeyState, error) {
 	rows, err := db.conn.Query(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE provider_alias = ? AND COALESCE(is_deleted, 0) = 0`, alias)
+		 FROM key_states WHERE provider_alias = ?`, alias)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +310,7 @@ func (db *DB) GetProviderKeys(alias string) ([]models.KeyState, error) {
 func (db *DB) GetAllDisabledKeys() ([]models.KeyState, error) {
 	rows, err := db.conn.Query(
 		`SELECT key_value, provider_alias, fail_count, is_active, cool_down_until, updated_at
-		 FROM key_states WHERE is_active = 0 AND COALESCE(is_deleted, 0) = 0`)
+		 FROM key_states WHERE is_active = 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -526,13 +495,6 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// SoftDeleteKey marks a key as deleted (soft delete) and deactivates it.
-func (db *DB) SoftDeleteKey(keyValue string) error {
-	_, err := db.conn.Exec(
-		`UPDATE key_states SET is_deleted = 1, is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE key_value = ?`, keyValue)
-	return err
-}
-
 // DisableKey deactivates a key without changing its fail count.
 func (db *DB) DisableKey(keyValue string) error {
 	_, err := db.conn.Exec(
@@ -561,7 +523,6 @@ func (db *DB) GetAllKeyStats() ([]models.KeyStats, error) {
 			WHERE is_test_request = 0
 			GROUP BY assigned_key
 		) rl ON ks.key_value = rl.assigned_key
-		WHERE COALESCE(ks.is_deleted, 0) = 0
 		ORDER BY ks.provider_alias, ks.key_value
 	`)
 	if err != nil {

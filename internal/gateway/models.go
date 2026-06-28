@@ -14,8 +14,8 @@ import (
 // ModelCache holds the aggregated model list in memory.
 type ModelCache struct {
 	mu      sync.RWMutex
-	models  map[string][]string       // provider_alias -> []prefixed_model_id
-	rawData []map[string]interface{}   // cached JSON response data
+	models  map[string][]string      // provider_alias -> []prefixed_model_id
+	rawData []map[string]interface{} // cached JSON response data
 }
 
 // newModelCache creates an empty ModelCache.
@@ -151,6 +151,16 @@ func (mc *ModelCache) buildResponseData() {
 
 // getModelsHandler handles GET /v1/models requests.
 func (s *Server) getModelsHandler(w http.ResponseWriter, r *http.Request) {
+	// Check if config needs reload (new providers may have been added to YAML)
+	s.cfgMu.RLock()
+	currentProviders := len(s.cfg.Providers)
+	s.cfgMu.RUnlock()
+
+	cachedModels := s.modelCache.GetModels()
+	if len(cachedModels) != currentProviders {
+		go s.reloadConfig()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 
 	s.modelCache.mu.RLock()

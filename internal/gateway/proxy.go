@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,13 +46,17 @@ func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Reque
 	parts := strings.SplitN(chatReq.Model, "/", 2)
 	alias := parts[0]
 
-	// Verify provider exists
+	// Verify provider exists — if not, try reloading config (YAML may have new providers)
 	provider, ok := s.cfg.Providers[alias]
 	if !ok {
-		writeOpenAIError(w, http.StatusNotFound,
-			fmt.Sprintf("Unknown provider alias %q in model %q", alias, chatReq.Model),
-			"invalid_request_error", "404")
-		return
+		s.reloadConfig()
+		provider, ok = s.cfg.Providers[alias]
+		if !ok {
+			writeOpenAIError(w, http.StatusNotFound,
+				fmt.Sprintf("Unknown provider alias %q in model %q", alias, chatReq.Model),
+				"invalid_request_error", "404")
+			return
+		}
 	}
 
 	receiver := getReceiverFromContext(r)
@@ -82,7 +87,7 @@ func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Reque
 	upstreamURL := strings.TrimRight(provider.BaseURL, "/") + "/chat/completions"
 
 	// Phase 1 & 2 transparent retry
-	upstreamResp, usedKey, err := s.sendWithRetry(r.Context(), upstreamURL, modifiedBody, alias, chatReq.Model, receiver)
+	upstreamResp, usedKey, err := s.sendWithRetry(r.Context(), upstreamURL, modifiedBody, alias, chatReq.Model, receiver, chatReq.Stream)
 	if err != nil {
 		log.Printf("[proxy] all retry attempts exhausted for %q: %v", alias, err)
 		writeOpenAIError(w, http.StatusBadGateway,
@@ -106,7 +111,7 @@ func (s *Server) postChatCompletionsHandler(w http.ResponseWriter, r *http.Reque
 // Phase 1: try active keys (YAML keys with is_active=1).
 // Phase 2 (dead-key resurrection): if all active keys fail, try ALL YAML keys.
 // If a Phase 2 key succeeds, it is automatically re-enabled in the database.
-func (s *Server) sendWithRetry(ctx context.Context, upstreamURL string, body []byte, alias, model string, receiver *receiverInfo) (*http.Response, string, error) {
+func (s *Server) sendWithRetry(ctx context.Context, upstreamURL string, body []byte, alias, model string, receiver *receiverInfo, stream bool) (*http.Response, string, error) {
 	providerCfg := s.cfg.Providers[alias]
 	yamlKeys := providerCfg.Keys
 
@@ -116,7 +121,7 @@ func (s *Server) sendWithRetry(ctx context.Context, upstreamURL string, body []b
 		return nil, "", fmt.Errorf("db error: %w", err)
 	}
 	for _, key := range activeKeys {
-		resp, tryErr := s.tryKey(ctx, key.KeyValue, upstreamURL, body, alias, model, receiver)
+		resp, tryErr := s.tryKey(ctx, key.KeyValue, upstreamURL, body, alias, model, receiver, stream)
 		if tryErr == nil {
 			// Success — reset fail count
 			if err := s.db.ResetFailCount(key.KeyValue); err != nil {
@@ -136,7 +141,7 @@ func (s *Server) sendWithRetry(ctx context.Context, upstreamURL string, body []b
 		return nil, "", fmt.Errorf("db error: %w", err)
 	}
 	for _, key := range allKeys {
-		resp, tryErr := s.tryKey(ctx, key.KeyValue, upstreamURL, body, alias, model, receiver)
+		resp, tryErr := s.tryKey(ctx, key.KeyValue, upstreamURL, body, alias, model, receiver, stream)
 		if tryErr == nil {
 			// Resurrect: re-enable and reset fail count
 			log.Printf("[proxy] dead key %q resurrected!", key.KeyValue)
@@ -159,7 +164,8 @@ func (s *Server) sendWithRetry(ctx context.Context, upstreamURL string, body []b
 // tryKey sends a single request to upstream with the given key.
 // Returns the response on success (HTTP 200). On failure, records the failure
 // in the database and returns an error (without writing to the client).
-func (s *Server) tryKey(ctx context.Context, keyValue, upstreamURL string, body []byte, alias, model string, receiver *receiverInfo) (*http.Response, error) {
+// For streaming requests, only HTTP status is checked (no body reading).
+func (s *Server) tryKey(ctx context.Context, keyValue, upstreamURL string, body []byte, alias, model string, receiver *receiverInfo, stream bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -176,13 +182,38 @@ func (s *Server) tryKey(ctx context.Context, keyValue, upstreamURL string, body 
 
 	if resp.StatusCode != http.StatusOK {
 		// Non-200 — record failure and return
-		// Read body for logging but discard it (retry will create a new request)
 		errMsg := fmt.Sprintf("HTTP %d", resp.StatusCode)
 		log.Printf("[proxy] key %q returned %s", keyValue, errMsg)
 		s.recordKeyFailure(keyValue, resp.StatusCode, nil, alias, model, receiver)
 		return resp, fmt.Errorf("%s", errMsg)
 	}
 
+	// For streaming requests, don't read body — just return success
+	// Reading body would block until stream ends, causing high TTFT
+	if stream {
+		return resp, nil
+	}
+
+	// HTTP 200 non-streaming — check response body for API-level errors
+	// Some servers return HTTP 200 but include error in response body
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var errResp struct {
+		Error *struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != nil {
+		if code, err := strconv.Atoi(errResp.Error.Code); err == nil {
+			log.Printf("[proxy] key %q returned API error code %s", keyValue, errResp.Error.Code)
+			s.recordKeyFailure(keyValue, code, nil, alias, model, receiver)
+			return nil, fmt.Errorf("API error code %s", errResp.Error.Code)
+		}
+	}
+
+	// Re-wrap body for caller
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	return resp, nil
 }
 

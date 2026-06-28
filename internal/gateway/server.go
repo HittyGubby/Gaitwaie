@@ -3,8 +3,10 @@ package gateway
 import (
 	"log"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
+	"github.com/HittyGubby/gaitwaie/internal/config"
 	"github.com/HittyGubby/gaitwaie/internal/database"
 	"github.com/HittyGubby/gaitwaie/internal/models"
 )
@@ -15,18 +17,21 @@ type providerConfig = models.Provider
 // Server holds all shared state for the HTTP gateway.
 type Server struct {
 	cfg        *models.Config
+	cfgPath    string
 	db         *database.DB
 	httpClient *http.Client
 	modelCache *ModelCache
 	rrCounters map[string]*atomic.Uint64 // per-provider round-robin counters
 	httpServer *http.Server
+	cfgMu      sync.RWMutex // protects cfg access during reload
 }
 
 // NewServer creates and initializes a new gateway server.
 // It does NOT start the HTTP listener — call Serve() to do that.
-func NewServer(cfg *models.Config, db *database.DB) *Server {
+func NewServer(cfg *models.Config, cfgPath string, db *database.DB) *Server {
 	s := &Server{
 		cfg:        cfg,
+		cfgPath:    cfgPath,
 		db:         db,
 		httpClient: &http.Client{},
 		modelCache: newModelCache(),
@@ -39,6 +44,35 @@ func NewServer(cfg *models.Config, db *database.DB) *Server {
 	}
 
 	return s
+}
+
+// reloadConfig reloads the YAML configuration and syncs new providers/keys.
+func (s *Server) reloadConfig() {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
+	newCfg, err := config.Load(s.cfgPath)
+	if err != nil {
+		log.Printf("[gateway] failed to reload config: %v", err)
+		return
+	}
+
+	// Sync new keys to database
+	for alias, provider := range newCfg.Providers {
+		if err := s.db.SyncKeysExclusive(alias, provider.Keys); err != nil {
+			log.Printf("[gateway] failed to sync keys for %q: %v", alias, err)
+		}
+		// Initialize round-robin counter for new providers
+		if _, exists := s.rrCounters[alias]; !exists {
+			s.rrCounters[alias] = new(atomic.Uint64)
+		}
+	}
+
+	s.cfg = newCfg
+	log.Printf("[gateway] config reloaded: %d provider(s)", len(newCfg.Providers))
+
+	// Refresh models in background
+	go s.RefreshModels()
 }
 
 // RefreshModelsAsync starts an async refresh of the model cache.
