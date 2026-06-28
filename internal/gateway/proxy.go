@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -183,6 +184,26 @@ func (s *Server) tryKey(ctx context.Context, keyValue, upstreamURL string, body 
 		return resp, fmt.Errorf("%s", errMsg)
 	}
 
+	// HTTP 200 — check response body for API-level errors
+	// Some servers return HTTP 200 but include error in response body
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var errResp struct {
+		Error *struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(bodyBytes, &errResp) == nil && errResp.Error != nil {
+		if code, err := strconv.Atoi(errResp.Error.Code); err == nil {
+			log.Printf("[proxy] key %q returned API error code %s", keyValue, errResp.Error.Code)
+			s.recordKeyFailure(keyValue, code, nil, alias, model, receiver)
+			return nil, fmt.Errorf("API error code %s", errResp.Error.Code)
+		}
+	}
+
+	// Re-wrap body for caller
+	resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	return resp, nil
 }
 

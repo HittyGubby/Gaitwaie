@@ -27,7 +27,6 @@ const (
 	stateNormal tuiState = iota
 	stateSingleModelSelect
 	statePurgeModelSelect
-	stateDeleteConfirm
 	stateFetching
 )
 
@@ -102,9 +101,6 @@ type manageModel struct {
 	modalCursor int
 	modalOffset int
 
-	// Delete confirmation
-	deleteKey string
-
 	// Purge state
 	purgeAliases []string
 	purgeIdx     int
@@ -135,8 +131,6 @@ func (m manageModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateNormal(msg)
 		case stateSingleModelSelect, statePurgeModelSelect:
 			return m.updateModelSelect(msg)
-		case stateDeleteConfirm:
-			return m.updateDeleteConfirm(msg)
 		case stateFetching:
 			return m, nil
 		}
@@ -177,16 +171,6 @@ func (m manageModel) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.db.ReenableKey(row.stats.KeyValue)
 				}
 				m.refreshData()
-			}
-		}
-
-	case "d":
-		if m.cursorIdx >= 0 && m.cursorIdx < len(m.selectableIdxs) {
-			row := m.rows[m.selectableIdxs[m.cursorIdx]]
-			if row.stats != nil {
-				m.deleteKey = row.stats.KeyValue
-				m.modalAlias = row.stats.ProviderAlias
-				m.state = stateDeleteConfirm
 			}
 		}
 
@@ -256,7 +240,7 @@ func (m manageModel) updateModelSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.modalOffset = m.modalCursor - maxVisible + 1
 		}
 
-	case "enter":
+	case "y", "enter":
 		if len(m.modalModels) == 0 {
 			return m, nil
 		}
@@ -308,28 +292,6 @@ func (m manageModel) updateModelSelect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m manageModel) updateDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "y":
-		m.db.SoftDeleteKey(m.deleteKey)
-		if err := config.RemoveProviderKey(configPath, m.modalAlias, m.deleteKey); err != nil {
-			m.err = fmt.Errorf("update config: %w", err)
-		}
-		if cfg, err := config.Load(configPath); err == nil {
-			m.cfg = cfg
-		}
-		m.state = stateNormal
-		m.refreshData()
-		m.deleteKey = ""
-
-	case "n", "esc":
-		m.state = stateNormal
-		m.deleteKey = ""
-	}
-
-	return m, nil
-}
-
 func (m manageModel) updateTestDone(msg testDoneMsg) (tea.Model, tea.Cmd) {
 	if msg.success {
 		m.testResults[msg.keyValue] = fmt.Sprintf("OK (%s tokens)", formatTokens(msg.tokens))
@@ -374,11 +336,18 @@ func (m manageModel) View() string {
 		m.width = 80
 	}
 
+	// Check minimum terminal width
+	if m.width < 100 {
+		msg := "Requires a minimal terminal width of 100"
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, style.Render(msg))
+	}
+
 	var b strings.Builder
 
 	// Header
 	title := headerStyle.Render(" Manage API Keys ")
-	hints := hintStyle.Render(" [Space] Toggle  [d] Delete  [t] Test  [p] Purge  [Esc/q] Quit")
+	hints := hintStyle.Render(" [Space] Toggle  [t] Test  [p] Purge  [Esc/q] Quit")
 	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Center, title, hints))
 	b.WriteString("\n\n")
 
@@ -398,8 +367,6 @@ func (m manageModel) View() string {
 	switch m.state {
 	case stateSingleModelSelect, statePurgeModelSelect:
 		b.WriteString(m.renderModelSelectModal())
-	case stateDeleteConfirm:
-		b.WriteString(m.renderDeleteConfirmModal())
 	case stateFetching:
 		b.WriteString(hintStyle.Render(" Fetching models..."))
 	default:
@@ -412,7 +379,7 @@ func (m manageModel) View() string {
 }
 
 func (m manageModel) computeColWidths() (keyW, statusW, failW, reqW, promptW, complW, totalW, testW int) {
-	const maxKeyW = 30
+	const maxKeyW = 10
 	const minTestW = 12
 	spacing := 9 // 7 single-space separators + 1 double-space before TEST
 
@@ -599,26 +566,31 @@ func (m manageModel) renderModelSelectModal() string {
 	return modalBorderStyle.Render(b.String())
 }
 
-func (m manageModel) renderDeleteConfirmModal() string {
-	var b strings.Builder
-
-	b.WriteString(lipgloss.NewStyle().Bold(true).Render("Confirm Delete"))
-	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("Delete key %s?\n", m.deleteKey))
-	b.WriteString("This will soft-delete the key from routing.\n\n")
-	b.WriteString(hintStyle.Render("[y] Confirm  [n/Esc] Cancel"))
-
-	return modalBorderStyle.Render(b.String())
-}
-
 // Data helpers
 
 func (m *manageModel) refreshData() {
-	stats, err := m.db.GetAllKeyStats()
+	// Build set of YAML-declared keys
+	yamlKeySet := make(map[string]bool)
+	for _, provider := range m.cfg.Providers {
+		for _, key := range provider.Keys {
+			yamlKeySet[key] = true
+		}
+	}
+
+	allStats, err := m.db.GetAllKeyStats()
 	if err != nil {
 		m.err = err
 		return
 	}
+
+	// Only keep keys that exist in YAML
+	var stats []models.KeyStats
+	for _, s := range allStats {
+		if yamlKeySet[s.KeyValue] {
+			stats = append(stats, s)
+		}
+	}
+
 	m.allStats = stats
 	m.rows = buildDisplayRows(stats, m.cfg)
 	m.selectableIdxs = getSelectableIndices(m.rows)
@@ -787,8 +759,12 @@ func sendManageTestRequest(client *http.Client, url, key string, body []byte) (b
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		errMsg := string(bodyBytes)
-		if len(errMsg) > 100 {
-			errMsg = errMsg[:100]
+		// Flatten multi-line JSON to single line
+		errMsg = strings.ReplaceAll(errMsg, "\n", " ")
+		errMsg = strings.ReplaceAll(errMsg, "\r", " ")
+		errMsg = strings.TrimSpace(errMsg)
+		if len(errMsg) > 80 {
+			errMsg = errMsg[:80] + "..."
 		}
 		return false, 0, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, errMsg)
 	}
@@ -908,9 +884,23 @@ var manageCmd = &cobra.Command{
 		}
 
 		// Load data
-		stats, err := db.GetAllKeyStats()
+		allStats, err := db.GetAllKeyStats()
 		if err != nil {
 			return fmt.Errorf("get key stats: %w", err)
+		}
+
+		// Only keep keys that exist in YAML
+		yamlKeySet := make(map[string]bool)
+		for _, provider := range cfg.Providers {
+			for _, key := range provider.Keys {
+				yamlKeySet[key] = true
+			}
+		}
+		var stats []models.KeyStats
+		for _, s := range allStats {
+			if yamlKeySet[s.KeyValue] {
+				stats = append(stats, s)
+			}
 		}
 
 		modelCache, err := db.GetModelCache()
